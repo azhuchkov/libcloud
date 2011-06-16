@@ -239,6 +239,10 @@ class RackspaceNodeDriver(NodeDriver):
              'flavorId': str(size.id)}
         )
 
+        shared_ip_id = kwargs.get("ex_shared_ip_group")
+        if shared_ip_id:
+            server_elm.attrib['sharedIpGroupId'] = shared_ip_id
+
         metadata_elm = self._metadata_to_xml(kwargs.get("ex_metadata", {}))
         if metadata_elm:
             server_elm.append(metadata_elm)
@@ -246,11 +250,6 @@ class RackspaceNodeDriver(NodeDriver):
         files_elm = self._files_to_xml(kwargs.get("ex_files", {}))
         if files_elm:
             server_elm.append(files_elm)
-
-        shared_ip_elm = self._shared_ip_group_to_xml(
-            kwargs.get("ex_shared_ip_group", None))
-        if shared_ip_elm:
-            server_elm.append(shared_ip_elm)
 
         resp = self.connection.request("/servers",
                                        method='POST',
