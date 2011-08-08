@@ -64,9 +64,69 @@ class OpenStackJsonResponse(MossoBasedResponse):
             msg = self.body
         return self.error, self.status, first_level_key, msg
 
+class DummyAuthProvider(object):
+    def authenticate(self, connection):
+        pass
+
+class KeyStoneAuthProvider(object):
+    def __init__(self, port, host=None, tenant_id=None, version='v2.0'):
+        self.port = port
+        self.host = host
+        self.tenant_id = tenant_id
+        self.version = version
+
+    def authenticate(self, connection):
+        credentials = {
+            'username': connection.user_id,
+            'password': connection.key
+        }
+
+        if self.tenant_id:
+            credentials['tenantId'] = self.tenant_id
+
+        # Initial connection used for authentication
+        conn = connection.conn_classes[connection.secure](
+            self.host or connection.host, self.port)
+
+        try:
+            conn.request(
+                method='POST',
+                url='/%s/tokens' % self.version,
+                headers={
+                    'Content-Type': 'application/json',
+                    'Accept': 'application/json'
+                },
+                body=json.dumps({'passwordCredentials': credentials})
+            )
+
+            self._handle_response(conn.getresponse(), connection)
+        finally:
+            if conn:
+                conn.close()
+
+    def _handle_response(self, resp, conn):
+        if resp.status == httplib.OK:
+            # HTTP OK (200): auth successful
+            try:
+                auth = json.loads(resp.read())
+                conn.auth_token = auth['auth']['token']['id']
+            except Exception as e:
+                # Returned 200 but has missing information in the header, something is wrong
+                raise MalformedResponseError('Malformed response',
+                                             body='Invalid response body',
+                                             driver=conn.driver)
+        elif resp.status == httplib.UNAUTHORIZED:
+            # HTTP UNAUTHORIZED (401): auth failed
+            raise InvalidCredsError()
+        else:
+            # Any response code != 401 or 204, something is wrong
+            raise MalformedResponseError('Malformed response',
+                                         body='code: %s body:%s' % (resp.status, ''.join(resp.body.readlines())),
+                                         driver=conn.driver)
+
 
 def OpenStackNodeDriver(version, username, api_key, secure=None, auth_host=None,
-                        auth_port=None, version_url=None):
+                        auth_port=None, version_url=None, auth_provider=DummyAuthProvider()):
     """ A helper function to instantiate driver of desired type, depending on which openstack
     API version is used
 
@@ -83,7 +143,7 @@ def OpenStackNodeDriver(version, username, api_key, secure=None, auth_host=None,
     else:
         if isinstance(version, dict):
             return OpenStackNodeDriver_v1_1(username, api_key, url=version_url, version=version['version'], version_code_name=version['version_code_name'])
-        return OpenStackNodeDriver_v1_1(username, api_key, url=version_url, version=version)
+        return OpenStackNodeDriver_v1_1(username, api_key, url=version_url, version=version, auth_provider=auth_provider)
 
 
 
@@ -103,7 +163,7 @@ class OpenStackConnection_v1_1(MossoBasedConnection):
 
     responseCls = OpenStackJsonResponse
 
-    def __init__(self, user_name, api_key, url, secure, version=None):
+    def __init__(self, user_name, api_key, url, secure, version='v1.1'):
         auth_endpoint, self.version = self._request_auth_endpoint(url, version)
 
         auth_endpoint = urlparse.urlparse(auth_endpoint)
@@ -114,6 +174,23 @@ class OpenStackConnection_v1_1(MossoBasedConnection):
         secure = auth_endpoint.scheme == 'https'
 
         super(OpenStackConnection_v1_1, self).__init__(user_name, api_key, auth_host, secure, auth_port, auth_path)
+        
+        self.port = (auth_port, auth_port)
+        self.auth_provider = None
+        self.version = version
+
+    @property
+    def host(self):
+        return self.auth_host
+
+    def connect(self, host=None, port=None):
+        if not self.auth_token:
+            self.server_url = 'http%s://%s:%s/%s' %\
+                              ('s' if self.secure else '', self.auth_host, self.auth_port, self.version)
+            self.__server_url = self.auth_host
+            self.auth_provider.authenticate(self)
+
+        super(OpenStackConnection_v1_1, self).connect(host, port)
 
     def _request_auth_endpoint(self, url, version):
         conn = None
@@ -223,7 +300,7 @@ class OpenStackNodeDriver_v1_1(MossoBasedNodeDriver):
                        'DELETE_IP': NodeState.PENDING,
                        'UNKNOWN': NodeState.UNKNOWN}
 
-    def __init__(self, user_name, api_key, url, secure=False, version=None, version_code_name=None):
+    def __init__(self, user_name, api_key, url, secure=False, version=None, version_code_name=None, auth_provider=DummyAuthProvider()):
         """
         user_name NOVA_USERNAME as reported by OpenStack
         api_key NOVA_API_KEY as reported by OpenStack
@@ -238,6 +315,7 @@ class OpenStackNodeDriver_v1_1(MossoBasedNodeDriver):
                                               secure=secure,
                                               version=version)
         self.connection.driver = self
+        self.connection.auth_provider = auth_provider
         self.connection.connect()
         self.version_code_name=version_code_name
 
